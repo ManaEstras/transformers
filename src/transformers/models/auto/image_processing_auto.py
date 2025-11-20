@@ -108,6 +108,7 @@ else:
             ("grounding-dino", ("GroundingDinoImageProcessor", "GroundingDinoImageProcessorFast")),
             ("groupvit", ("CLIPImageProcessor", "CLIPImageProcessorFast")),
             ("hiera", ("BitImageProcessor", "BitImageProcessorFast")),
+            ("hunyuan_vl", ("HunYuanVlImageProcessor", None)),
             ("idefics", ("IdeficsImageProcessor", None)),
             ("idefics2", ("Idefics2ImageProcessor", "Idefics2ImageProcessorFast")),
             ("idefics3", ("Idefics3ImageProcessor", "Idefics3ImageProcessorFast")),

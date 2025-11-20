@@ -991,6 +991,7 @@ MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES = OrderedDict(
         ("ovis2", "Ovis2ForConditionalGeneration"),
         ("paligemma", "PaliGemmaForConditionalGeneration"),
         ("pix2struct", "Pix2StructForConditionalGeneration"),
+        ("hunyuan_vl", "HunYuanVLForConditionalGeneration"),
         ("qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),
         ("qwen2_vl", "Qwen2VLForConditionalGeneration"),
         ("qwen3_vl", "Qwen3VLForConditionalGeneration"),
