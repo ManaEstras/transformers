@@ -82,6 +82,7 @@ PROCESSOR_MAPPING_NAMES = OrderedDict(
         ("grounding-dino", "GroundingDinoProcessor"),
         ("groupvit", "CLIPProcessor"),
         ("hubert", "Wav2Vec2Processor"),
+        ("hunyuan_vl", "HunYuanVLProcessor"),
         ("idefics", "IdeficsProcessor"),
         ("idefics2", "Idefics2Processor"),
         ("idefics3", "Idefics3Processor"),
