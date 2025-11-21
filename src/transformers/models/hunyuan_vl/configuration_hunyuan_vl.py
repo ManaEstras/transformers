@@ -51,6 +51,7 @@ class HunYuanVLVisionConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.interpolate_mode = interpolate_mode
         self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_attention_heads
         self.num_channels = num_channels
         self.num_hidden_layers = num_hidden_layers
         self.out_hidden_size = out_hidden_size
