@@ -343,7 +343,7 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-def apply_rotary_pos_emb_xdrope(q, k, cos, sin, position_ids, xdrope_section, output_size=None, bf16=False):
+def apply_rotary_pos_emb_xdrope(q, k, cos, sin, position_ids, xdrope_section, output_size=None):
     # xd-rope 支持统一token任意维度的position id，最终的cos和sin按照xdrope_section里指定的比例提取后拼接
     # 写这个函数的英文文档
     """Applies XD Rotary Position Embedding to the query and key tensors.
@@ -377,10 +377,12 @@ def apply_rotary_pos_emb_xdrope(q, k, cos, sin, position_ids, xdrope_section, ou
     cos = cos.view(output_size[0], 1, output_size[2], -1)  # .repeat(1, output_size[1], 1, 1)
     sin = sin.view(output_size[0], 1, output_size[2], -1)  # .repeat(1, output_size[1], 1, 1)
 
-    if bf16:
-        return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
-    else:
-        return (q * cos) + (rotate_half(q) * sin).to(q.dtype), (k * cos) + (rotate_half(k) * sin).to(k.dtype)
+    origin_dtype = q.dtype
+    q, k = q.float(), k.float()
+    cos, sin = cos.float(), sin.float()
+    q_out, k_out = (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+
+    return q_out.to(origin_dtype), k_out.to(origin_dtype)
 
 
 def apply_rotary_pos_emb(
@@ -553,9 +555,8 @@ class HunYuanVLAttention(nn.Module):
                     query_states.size(2),
                     key_states.size(2),
                 )
-                bf16 = self.config.dtype == torch.bfloat16
                 query_states, key_states = apply_rotary_pos_emb_xdrope(
-                    query_states, key_states, cos, sin, position_ids, self.xdrope_section, output_size, bf16
+                    query_states, key_states, cos, sin, position_ids, self.xdrope_section, output_size
                 )
             else:
                 position_ids = (
