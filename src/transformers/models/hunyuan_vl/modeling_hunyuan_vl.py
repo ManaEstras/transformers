@@ -19,7 +19,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from collections.abc import Callable
 from typing import Optional, Union
 
@@ -103,8 +102,8 @@ class HunYuanVisionPatchEmbed(nn.Module):
 
         self.max_num_patches = (config.max_image_size // self.patch_size) ** 2
         self.num_positions = self.max_num_patches + 1
-        self.position_ids = torch.arange(self.num_positions).expand((1, -1))
-        self.position_edge = int(math.sqrt(self.num_positions))
+        self.position_edge = int(self.num_positions ** 0.5)
+        # first token is cls token, skip it
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
 
         self.patch_pos_embed = None
@@ -157,7 +156,7 @@ class HunYuanVisionPatchMerger(nn.Module):
     ):
         super().__init__()
 
-        embed_std = 1 / math.sqrt(out_channels)
+        embed_std = out_channels ** -0.5
         self.spatial_merge_size = spatial_merge_size
         self.proj = nn.Sequential(
             nn.Conv2d(in_channels, in_channels * 2, kernel_size=spatial_merge_size, stride=spatial_merge_size),
@@ -201,6 +200,7 @@ class HunYuanVisionAttention(nn.Module):
     def __init__(self, config: HunYuanVLConfig):
         super().__init__()
         self.config = config
+        self.is_causal = False   # used in flash_attention
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
@@ -497,6 +497,7 @@ class HunYuanVLAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.is_causal = True  # used in flash_attention
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
@@ -518,7 +519,6 @@ class HunYuanVLAttention(nn.Module):
         self.key_layernorm = HunYuanVLRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         self.rotary_emb = HunYuanVLRotaryEmbedding(config=config)
-        self.position_embedding_xdrope = config.position_embedding_xdrope
         self.xdrope_section = config.rope_scaling['xdrope_section']
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -545,8 +545,7 @@ class HunYuanVLAttention(nn.Module):
             kv_seq_len += past_key_values.get_seq_length(self.layer_idx)
 
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        if self.position_embedding_xdrope:
-            assert self.xdrope_section
+        if self.xdrope_section is not None:
             if past_key_values is None or past_key_values.get_seq_length() == 0:
                 output_size = (
                     query_states.size(0),
@@ -554,7 +553,7 @@ class HunYuanVLAttention(nn.Module):
                     query_states.size(2),
                     key_states.size(2),
                 )
-                bf16 = self.config.torch_dtype == torch.bfloat16
+                bf16 = self.config.dtype == torch.bfloat16
                 query_states, key_states = apply_rotary_pos_emb_xdrope(
                     query_states, key_states, cos, sin, position_ids, self.xdrope_section, output_size, bf16
                 )
@@ -940,7 +939,6 @@ class HunYuanVLForConditionalGeneration(HunYuanVLPreTrainedModel, GenerationMixi
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if "eos_token_id" in kwargs:
-            # print(f"kwargs['eos_token_id'] = {kwargs['eos_token_id']}, self.config.eod_token_id = {self.config.eod_token_id}")
             kwargs["eos_token_id"] = self.config.eod_token_id
 
         return super().generate(
@@ -948,17 +946,14 @@ class HunYuanVLForConditionalGeneration(HunYuanVLPreTrainedModel, GenerationMixi
             position_ids=position_ids,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
-            # eos_token_id=self.config.eod_token_id,
             **kwargs,
         )
 
-    # Copied from transformers.models.llava.modeling_llava.LlavaModel.get_placeholder_mask
     def get_placeholder_mask(
         self,
         input_ids: torch.LongTensor,
         inputs_embeds: torch.FloatTensor,
         image_features: Optional[torch.FloatTensor] = None,
-        # video_features: Optional[torch.FloatTensor] = None,
     ):
         """
         Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
@@ -971,7 +966,6 @@ class HunYuanVLForConditionalGeneration(HunYuanVLPreTrainedModel, GenerationMixi
             special_image_mask = special_image_mask.all(-1)
         else:
             special_image_mask = input_ids == self.config.image_token_id
-            # special_video_mask = input_ids == self.config.video_token_id
 
         n_image_tokens = special_image_mask.sum()
         special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)

@@ -28,57 +28,38 @@ class HunYuanVLVisionConfig(PretrainedConfig):
 
     def __init__(
         self,
-        adaptor_patch_size=2,
         hidden_act="gelu",
         hidden_size=1152,
         intermediate_size=4304,
         interpolate_mode="bilinear",
-        layer_norm_eps=1e-05,
-        learnable_mlp_pooling_size=0,
+        rms_norm_eps=1e-05,
         num_attention_heads=16,
         num_channels=3,
         num_hidden_layers=27,
         out_hidden_size=4096,
         patch_size=16,
-        remove_prenorm=True,
+        spatial_merge_size=2,
         temporal_patch_size=1,
-        resize_resolution=2048,
-        img_max_token_num=4096,
-        max_image_size=2048,
-        video_max_image_size=768,
-        video_min_image_size=256,
         min_image_size=512,
-        anyres_vit_max_image_size=2048,
-        max_vit_seq_len=16384,
-        text_hidden_size=3072,
+        max_image_size=2048,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
-        self.adaptor_patch_size = adaptor_patch_size
         self.hidden_act = hidden_act
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.interpolate_mode = interpolate_mode
-        self.layer_norm_eps = layer_norm_eps
-        self.learnable_mlp_pooling_size = learnable_mlp_pooling_size
         self.num_attention_heads = num_attention_heads
         self.num_channels = num_channels
         self.num_hidden_layers = num_hidden_layers
         self.out_hidden_size = out_hidden_size
         self.patch_size = patch_size
-        self.remove_prenorm = remove_prenorm
-        self.temporal_patch_size = temporal_patch_size
 
-        self.resize_resolution = resize_resolution
-        self.img_max_token_num = img_max_token_num
+        self.rms_norm_eps= rms_norm_eps
+        self.spatial_merge_size = spatial_merge_size
         self.max_image_size = max_image_size
         self.min_image_size = min_image_size
-        self.video_max_image_size = video_max_image_size
-        self.video_min_image_size = video_min_image_size
-        self.anyres_vit_max_image_size = anyres_vit_max_image_size
-        self.max_vit_seq_len = max_vit_seq_len
-        self.text_hidden_size = text_hidden_size
 
 
 class HunYuanVLTextConfig(PretrainedConfig):
