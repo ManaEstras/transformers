@@ -128,11 +128,11 @@ class HunYuanVisionPatchEmbed(nn.Module):
             # see discussion at https://github.com/facebookresearch/dino/issues/8
             h0, w0 = h0 + 0.1, w0 + 0.1
             patch_pos_embed = nn.functional.interpolate(
-                self.patch_pos_embed,
+                self.patch_pos_embed.float(),
                 scale_factor=((h0 / self.position_edge).item(), (w0 / self.position_edge).item()),
                 mode=self.interpolate_mode,
                 align_corners=False,
-            )
+            ).to(self.patch_pos_embed.dtype)
 
             patch_pos_embed = (
                 patch_pos_embed.reshape(self.embed_dim, -1).transpose(0, 1).unsqueeze(0).to(patch_embeds.dtype)
