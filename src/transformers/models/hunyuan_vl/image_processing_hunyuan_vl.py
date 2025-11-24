@@ -226,7 +226,6 @@ class HunYuanVLImageProcessor(BaseImageProcessor):
                     max_pixels=size["longest_edge"],
                 )
                 image = image.resize((resized_width, resized_height))
-                print(f'image resize: ({width}, {height}) -> ({resized_width}, {resized_height})')
 
             if do_normalize:
                 image = transforms.Compose([

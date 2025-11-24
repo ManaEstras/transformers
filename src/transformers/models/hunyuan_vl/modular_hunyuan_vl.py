@@ -25,6 +25,7 @@ from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
 from ...masking_utils import create_causal_mask
+from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -96,6 +97,7 @@ class HunYuanVLVisionConfig(PretrainedConfig):
         rms_norm_eps=1e-05,
         learnable_mlp_pooling_size=0,
         num_attention_heads=16,
+        num_key_value_heads=None,
         num_channels=3,
         num_hidden_layers=27,
         out_hidden_size=4096,
@@ -122,6 +124,10 @@ class HunYuanVLVisionConfig(PretrainedConfig):
         self.interpolate_mode = interpolate_mode
         self.learnable_mlp_pooling_size = learnable_mlp_pooling_size
         self.num_attention_heads = num_attention_heads
+        if not num_key_value_heads:
+            self.num_key_value_heads = num_attention_heads
+        else:
+            self.num_key_value_heads = num_key_value_heads
         self.num_channels = num_channels
         self.num_hidden_layers = num_hidden_layers
         self.out_hidden_size = out_hidden_size
@@ -129,6 +135,7 @@ class HunYuanVLVisionConfig(PretrainedConfig):
         self.remove_prenorm = remove_prenorm
         self.spatial_merge_size = spatial_merge_size
         self.temporal_patch_size = temporal_patch_size
+        self.rms_norm_eps = rms_norm_eps
 
         self.resize_resolution = resize_resolution
         self.img_max_token_num = img_max_token_num
@@ -165,7 +172,7 @@ class HunYuanVLConfig(PretrainedConfig):
     ):
         # We need to init super() here so that it does not reset values
         # that are in text config to the BaseClass defaults. The Base
-        # config has many text related defaults and not all defaults are same as for `Qwen2_5_VLTextConfig`
+        # config has many text related defaults and not all defaults are same as for `HunYuanVLTextConfig`
         super().__init__(**kwargs)
 
         if isinstance(vision_config, dict):
@@ -215,47 +222,304 @@ class HunYuanVLConfig(PretrainedConfig):
         return super().__getattribute__(key)
 
 
+class HunYuanVisionMLP(nn.Module):
+    def __init__(self, config: HunYuanVLConfig):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.act_fn = ACT2FN[config.hidden_act]
+        self.dense_h_to_4h = nn.Linear(self.hidden_size, self.intermediate_size, bias=True)
+        self.dense_4h_to_h = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
+
+    def forward(self, x):
+        intermediate = self.dense_h_to_4h(x)
+        intermediate = self.act_fn(intermediate)
+        output = self.dense_4h_to_h(intermediate)
+        return output
+
+
 class HunYuanVLRMSNorm(LlamaRMSNorm):
     pass
 
+class HunYuanVLMLP(HunYuanDenseV1MLP):
+    pass
 
-class HunYuanVLMLP(nn.Module):
-    def __init__(self, config: Union[HunYuanVLConfig, HunYuanVLTextConfig], layer_idx=None):
+class HunYuanVisionPatchEmbed(nn.Module):
+    def __init__(self, config: HunYuanVLVisionConfig):
+        super().__init__()
+
+        self.config = config
+        self.embed_dim = config.hidden_size
+        self.patch_size = config.patch_size
+        self.num_channels = config.num_channels
+        self.spatial_merge_size = config.spatial_merge_size
+        self.interpolate_mode = config.interpolate_mode
+
+        self.patch_embedding = nn.Conv2d(
+            in_channels=config.num_channels,
+            out_channels=self.embed_dim,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+            bias=True,
+        )
+
+        self.max_num_patches = (config.max_image_size // self.patch_size) ** 2
+        self.num_positions = self.max_num_patches + 1
+        self.position_edge = int(self.num_positions ** 0.5)
+        # first token is cls token, skip it
+        self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
+
+        self.patch_pos_embed = None
+
+    def forward(self, pixel_values: torch.Tensor, grid_thw: list[list[int]]) -> torch.Tensor:
+        num_patches, hidden_size = pixel_values.shape
+        pixel_values = pixel_values.reshape(num_patches, self.num_channels, self.patch_size, self.patch_size)
+
+        patch_embeds = self.patch_embedding(pixel_values)
+        patch_embeds = patch_embeds.squeeze(-1).squeeze(-1).unsqueeze(0)
+
+        if self.patch_pos_embed is None:
+            patch_pos_shape = (1, self.position_edge, self.position_edge, self.embed_dim)
+            self.patch_pos_embed = (
+                self.position_embedding.weight[1:, :].reshape(patch_pos_shape).permute(0, 3, 1, 2).float()
+            )
+
+        patch_pos_embed_list = []
+        for grid in grid_thw:
+            _, h0, w0 = grid
+            # we add a small number to avoid floating point error in the interpolation
+            # see discussion at https://github.com/facebookresearch/dino/issues/8
+            h0, w0 = h0 + 0.1, w0 + 0.1
+            patch_pos_embed = nn.functional.interpolate(
+                self.patch_pos_embed,
+                scale_factor=((h0 / self.position_edge).item(), (w0 / self.position_edge).item()),
+                mode=self.interpolate_mode,
+                align_corners=False,
+            )
+
+            patch_pos_embed = (
+                patch_pos_embed.reshape(self.embed_dim, -1).transpose(0, 1).unsqueeze(0).to(patch_embeds.dtype)
+            )
+            patch_pos_embed_list.append(patch_pos_embed)
+
+        patch_pos_embed = torch.cat(patch_pos_embed_list, dim=1)
+        embeddings = patch_embeds + patch_pos_embed
+
+        return embeddings
+
+
+class HunYuanVisionPatchMerger(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        spatial_merge_size,
+        rms_norm_eps,
+        **kwargs,
+    ):
+        super().__init__()
+
+        embed_std = out_channels ** -0.5
+        self.spatial_merge_size = spatial_merge_size
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels * 2, kernel_size=spatial_merge_size, stride=spatial_merge_size),
+            nn.GELU(),
+            nn.Conv2d(in_channels * 2, in_channels * 4, kernel_size=1),
+        )
+        self.mlp = nn.Linear(in_channels * 4, out_channels)
+        self.image_newline = nn.Parameter(torch.randn(in_channels * 4) * embed_std)
+        self.image_begin = nn.Parameter(torch.randn(out_channels) * embed_std)
+        self.image_end = nn.Parameter(torch.randn(out_channels) * embed_std)
+        self.image_sep = nn.Parameter(torch.randn(out_channels) * embed_std)
+
+        self.before_rms = HunYuanVLRMSNorm(in_channels, eps=rms_norm_eps)
+        self.after_rms = HunYuanVLRMSNorm(out_channels, eps=rms_norm_eps)
+
+    def forward(self, x, size=(16, 16)):
+        x = self.before_rms(x)
+        h, w = size
+        dtype = x.dtype
+        x = x.permute(0, 2, 1).reshape(x.shape[0], -1, int(h.item()), int(w.item()))
+        x = self.proj(x)  # b,c,h,w
+        b, c, h, w = x.shape
+        x = torch.cat(
+            [x, self.image_newline.reshape(1, c, 1, 1).expand(b, c, h, 1).to(dtype, non_blocking=True)], dim=-1
+        )
+        x = x.reshape(b, c, -1).permute(0, 2, 1)
+        x = self.mlp(x)
+
+        begin = self.image_begin.reshape(1, 1, -1).expand(b, 1, x.shape[-1]).to(dtype, non_blocking=True)
+        end = self.image_end.reshape(1, 1, -1).expand(b, 1, x.shape[-1]).to(dtype, non_blocking=True)
+        x = torch.cat([begin, x, end], dim=1)
+
+        return self.after_rms(x)
+
+
+class HunYuanVisionAttention(nn.Module):
+    def __init__(self, config: HunYuanVLConfig):
         super().__init__()
         self.config = config
-        self.layer_idx = layer_idx
+        self.is_causal = False   # used in flash_attention
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=True
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=True
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
+class HunYuanVisionBlock(GradientCheckpointingLayer):
+    def __init__(self, config: HunYuanVLVisionConfig):
+        super().__init__()
         self.hidden_size = config.hidden_size
-        self.hidden_act = config.hidden_act
+        self.self_attn = HunYuanVisionAttention(config)
+        self.mlp = HunYuanVisionMLP(config)
+        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.intermediate_size = config.intermediate_size
-        self.act_fn = ACT2FN[config.hidden_act]
-        if self.hidden_act == "silu":
-            self.intermediate_size = config.intermediate_size
-            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        elif self.hidden_act == "gelu":
-            self.dense_h_to_4h = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-            self.dense_4h_to_h = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
-        else:
-            assert False, "other hidden_act are not supported"
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        # Self Attention
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
 
-    def forward(self, x):
-        if self.hidden_act == "silu":
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-            return down_proj
-        elif self.hidden_act == "gelu":
-            intermediate = self.dense_h_to_4h(x)
-            intermediate = self.act_fn(intermediate)
-            output = self.dense_4h_to_h(intermediate)
-            return output
-        else:
-            assert False, "other hidden_act are not supported"
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
 
 
-def apply_rotary_pos_emb_xdrope(q, k, cos, sin, position_ids, xdrope_section, output_size=None, bf16=False):
-    # xd-rope 支持统一token任意维度的position id，最终的cos和sin按照xdrope_section里指定的比例提取后拼接
-    # 写这个函数的英文文档
+class HunYuanVisionTransformer(nn.Module):
+    config: HunYuanVLVisionConfig
+    _no_split_modules = ["HunYuanVLVisionBlock"]
+
+    def __init__(self, config: HunYuanVLVisionConfig):
+        super().__init__()
+        self.config = config
+        self.embeddings = HunYuanVisionPatchEmbed(config)
+        self.layers = nn.ModuleList(
+            [HunYuanVisionBlock(config) for _ in range(config.num_hidden_layers)]
+        )
+        self.perceive = HunYuanVisionPatchMerger(
+            self.config.hidden_size,
+            self.config.text_hidden_size,
+            self.config.spatial_merge_size,
+            self.config.rms_norm_eps,
+        )
+
+    def get_activation_function(self, act_name: str):
+        act_map = {
+            "gelu": nn.GELU(),
+            "relu": nn.ReLU(),
+            "silu": nn.SiLU(),
+        }
+        return act_map.get(act_name.lower(), nn.GELU())  # default GELU
+
+    # @auto_docstring
+    def forward(
+        self,
+        x: torch.Tensor,
+        grid_thw: list[list[int]],
+    ) -> torch.Tensor:
+        #
+        r"""
+        grid_thw (`torch.LongTensor` of shape `(num_images, 3)`):
+            The temporal, height and width dimensions of feature shape for each image. Each row contains [t, h, w] values.
+        """
+        hidden_states = self.embeddings(x, grid_thw)
+        for layer in self.layers:
+            hidden_states = layer(hidden_states)
+
+        cu_seqlens: list = [0]
+        for t, h, w in grid_thw:
+            cu_seqlens.append((h * w).item())
+
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
+        cu_seqlens = torch.cumsum(cu_seqlens, dim=0, dtype=torch.int32)
+        split_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        split_items = torch.split(hidden_states, split_lengths, dim=1)
+
+        processed_items = []
+        for grid, item in zip(grid_thw, split_items):
+            t, h, w = grid
+            processed = self.perceive(item, size=(h, w))
+            processed_items.append(processed)
+
+        hidden_states = torch.cat(processed_items, dim=1)
+
+        return hidden_states
+
+
+def apply_rotary_pos_emb_xdrope(q, k, cos, sin, position_ids, xdrope_section, output_size=None):
     """Applies XD Rotary Position Embedding to the query and key tensors.
 
     Args:
@@ -272,25 +536,26 @@ def apply_rotary_pos_emb_xdrope(q, k, cos, sin, position_ids, xdrope_section, ou
         `tuple(torch.Tensor)`: The query and key tensors rotated using the XD Rotary Position Embedding.
     """
     x_dim = len(xdrope_section)
-
     cos = cos[position_ids, ...].permute(0, 2, 1, 3).reshape(output_size[0], output_size[2], x_dim, -1).contiguous()
     sin = sin[position_ids, ...].permute(0, 2, 1, 3).reshape(output_size[0], output_size[2], x_dim, -1).contiguous()
 
-    xdrope_section = [int(x * q.shape[-1] / 2) for x in xdrope_section] * 2
+    xdrope_section = xdrope_section * 2
 
     # for xd concat
-    assert sum(xdrope_section) == cos.shape[-1] , "Illegal partition for xd rope"
-    cos = torch.cat([m[:,:,i % x_dim,:] for i, m in enumerate(cos.split(xdrope_section, dim=-1))], dim=-1)
-    sin = torch.cat([m[:,:,i % x_dim,:] for i, m in enumerate(sin.split(xdrope_section, dim=-1))], dim=-1)
+    assert sum(xdrope_section) == cos.shape[-1], "Illegal partition for xd rope"
+    cos = torch.cat([m[:, :, i % x_dim, :] for i, m in enumerate(cos.split(xdrope_section, dim=-1))], dim=-1)
+    sin = torch.cat([m[:, :, i % x_dim, :] for i, m in enumerate(sin.split(xdrope_section, dim=-1))], dim=-1)
 
     # for head repeat
-    cos = cos.view(output_size[0], 1, output_size[2], -1) #.repeat(1, output_size[1], 1, 1)
-    sin = sin.view(output_size[0], 1, output_size[2], -1) #.repeat(1, output_size[1], 1, 1)
+    cos = cos.view(output_size[0], 1, output_size[2], -1)  # .repeat(1, output_size[1], 1, 1)
+    sin = sin.view(output_size[0], 1, output_size[2], -1)  # .repeat(1, output_size[1], 1, 1)
 
-    if bf16:
-        return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
-    else:
-        return (q * cos) + (rotate_half(q) * sin).to(q.dtype), (k * cos) + (rotate_half(k) * sin).to(k.dtype)
+    origin_dtype = q.dtype
+    q, k = q.float(), k.float()
+    cos, sin = cos.float(), sin.float()
+    q_out, k_out = (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+
+    return q_out.to(origin_dtype), k_out.to(origin_dtype)
 
 
 def apply_rotary_pos_emb(
@@ -324,153 +589,6 @@ def apply_rotary_pos_emb(
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
-
-class HunYuanVLAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-    def __init__(self, config, layer_idx: int):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
-        self.attention_dropout = config.attention_dropout
-        self.is_causal = True
-        self.use_qk_norm = config.use_qk_norm
-        self.use_rotary_pos_emb = config.use_rotary_pos_emb
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
-        )
-
-        if self.use_qk_norm:
-            self.query_layernorm = HunYuanVLRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.key_layernorm = HunYuanVLRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-
-        if self.use_rotary_pos_emb:
-            self.rotary_emb = HunYuanVLRotaryEmbedding(config=config)
-            self.position_embedding_xdrope = config.position_embedding_xdrope
-            self.xdrope_section = config.xdrope_section
-
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        position_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        kv_seq_len = key_states.shape[-2]
-        origin_kv_seq_len = key_states.shape[-2]
-        if past_key_values is not None:
-            kv_seq_len += past_key_values.get_seq_length(self.layer_idx)
-        if self.use_rotary_pos_emb:
-            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-            if self.position_embedding_xdrope:
-                assert self.xdrope_section
-                if past_key_values is None or past_key_values.get_seq_length() == 0:
-                    output_size = (
-                        query_states.size(0),
-                        query_states.size(1),
-                        query_states.size(2),
-                        key_states.size(2),
-                    )
-                    bf16 = self.config.torch_dtype == torch.bfloat16
-                    query_states, key_states = apply_rotary_pos_emb_xdrope(
-                        query_states, key_states, cos, sin, position_ids, self.xdrope_section, output_size, bf16
-                    )
-                else:
-                    position_ids = (
-                        torch.ones(position_ids.shape[0], 1, dtype=torch.long, device=position_ids.device)
-                        * past_key_values.get_seq_length()
-                    )
-                    cos, sin = cos[-origin_kv_seq_len:, :], sin[-origin_kv_seq_len:, :]
-                    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-            else:
-                position_ids = (
-                        torch.ones(position_ids.shape[0], 1, dtype=torch.long, device=position_ids.device)
-                        * past_key_values.get_seq_length(self.layer_idx)
-                    )
-                cos, sin = cos[-origin_kv_seq_len:, :], sin[-origin_kv_seq_len:, :]
-                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if self.use_qk_norm:
-            query_states = self.query_layernorm(query_states)
-            key_states = self.key_layernorm(key_states)
-
-        if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
-
-
-class HunYuanVLDecoderLayer(LlamaDecoderLayer):
-    def __init__(
-        self,
-        config: Union[HunYuanVLVisionConfig, HunYuanVLTextConfig],
-        layer_idx: int):
-        super().__init__()
-        self.layer_idx = layer_idx
-        if config.norm_type == 'hf_rms' or config.norm_type == 'rms':
-            self.input_layernorm = HunYuanVLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.post_attention_layernorm = HunYuanVLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        elif config.norm_type == 'fused' or config.norm_type == 'torch_nn':
-            self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
-        else:
-            assert False, "other norm_type are not supported"
-
-class HunYuanVLPreTrainedModel(LlamaPreTrainedModel):
-    def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-
 class HunYuanVLRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
@@ -485,7 +603,7 @@ class HunYuanVLRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type if self.rope_type != "xdrope" else "dynamic"]
         if self.rope_type in ["xdrope", "dynamic"] and config.rope_scaling["alpha"]:
             # DynamicNTKAlphaRotary
             self.dim = config.head_dim
@@ -510,7 +628,6 @@ class HunYuanVLRotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
-
     def forward(self, x, seq_len: Optional[int]=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
         if seq_len > self.max_seq_len_cached:
@@ -520,6 +637,143 @@ class HunYuanVLRotaryEmbedding(nn.Module):
             self.cos_cached[:seq_len].to(dtype=x.dtype),
             self.sin_cached[:seq_len].to(dtype=x.dtype),
         )
+
+
+class HunYuanVLAttention(nn.Module):
+
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.is_causal = True  # used in flash_attention
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+        )
+
+        self.query_layernorm = HunYuanVLRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.key_layernorm = HunYuanVLRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        self.rotary_emb = HunYuanVLRotaryEmbedding(config=config)
+        self.xdrope_section = config.rope_scaling['xdrope_section']
+
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        origin_kv_seq_len = key_states.shape[-2]
+        if past_key_values is not None:
+            kv_seq_len += past_key_values.get_seq_length(self.layer_idx)
+
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        if self.xdrope_section is not None:
+            if past_key_values is None or past_key_values.get_seq_length() == 0:
+                output_size = (
+                    query_states.size(0),
+                    query_states.size(1),
+                    query_states.size(2),
+                    key_states.size(2),
+                )
+                query_states, key_states = apply_rotary_pos_emb_xdrope(
+                    query_states, key_states, cos, sin, position_ids, self.xdrope_section, output_size
+                )
+            else:
+                position_ids = (
+                    torch.ones(position_ids.shape[0], 1, dtype=torch.long, device=position_ids.device)
+                    * past_key_values.get_seq_length()
+                )
+                cos, sin = cos[-origin_kv_seq_len:, :], sin[-origin_kv_seq_len:, :]
+                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        else:
+            position_ids = torch.ones(
+                position_ids.shape[0], 1, dtype=torch.long, device=position_ids.device
+            ) * past_key_values.get_seq_length(self.layer_idx)
+            cos, sin = cos[-origin_kv_seq_len:, :], sin[-origin_kv_seq_len:, :]
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        query_states = self.query_layernorm(query_states)
+        key_states = self.key_layernorm(key_states)
+
+        if past_key_values is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+class HunYuanVLDecoderLayer(LlamaDecoderLayer):
+    def __init__(
+        self,
+        config: Union[HunYuanVLVisionConfig, HunYuanVLTextConfig],
+        layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        if config.norm_type == 'hf_rms' or config.norm_type == 'rms':
+            self.input_layernorm = HunYuanVLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm = HunYuanVLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        elif config.norm_type == 'fused' or config.norm_type == 'torch_nn':
+            self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            assert False, "other norm_type are not supported"
+
+
+class HunYuanVLPreTrainedModel(LlamaPreTrainedModel):
+    def _init_weights(self, module):
+        std = self.config.initializer_range
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+
 
 @auto_docstring
 class HunYuanVLModel(HunYuanVLPreTrainedModel):
@@ -632,18 +886,41 @@ class HunYuanVLForConditionalGeneration(HunYuanVLPreTrainedModel, GenerationMixi
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, HunYuanVLForCausalLM
+        >>> from transformers import AutoProcessor, HunYuanVLForConditionalGeneration
+        >>> from PIL import Image
+        >>> import torch
 
-        >>> model = HunYuanVLForCausalLM.from_pretrained("meta-hunyuan_vl/HunYuanVL-2-7b-hf")
-        >>> tokenizer = AutoTokenizer.from_pretrained("meta-hunyuan_vl/HunYuanVL-2-7b-hf")
+        >>> model_name_or_path = "tencent/HunyuanOCR"
+        >>> processor = AutoProcessor.from_pretrained(model_name_or_path, use_fast=False)
+        >>> model = HunYuanVLForConditionalGeneration.from_pretrained(
+        ...     model_name_or_path,
+        ...     attn_implementation="eager",
+        ...     torch_dtype=torch.bfloat16,
+        ...     device_map="auto",
+        ... )
 
-        >>> prompt = "Hey, are you conscious? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
+        >>> img_path = "path/to/your/image.jpg"
+        >>> image = Image.open(img_path).convert("RGB")
 
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+        >>> messages = [
+        ...     {
+        ...         "role": "user",
+        ...         "content": [
+        ...             {"type": "image", "image": img_path},
+        ...             {"type": "text", "text": "Extract the text from the image."},
+        ...         ],
+        ...     }
+        ... ]
+        >>> text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        >>> inputs = processor(text=[text], images=[image], padding=True, return_tensors="pt").to(model.device)
+
+        >>> with torch.no_grad():
+        ...     generated_ids = model.generate(**inputs, max_new_tokens=1024)
+        >>> generated_ids_trimmed = generated_ids[0][len(inputs["input_ids"][0]):]
+        >>> output = processor.decode(generated_ids_trimmed, skip_special_tokens=True)
+
+        >>> print(output)
+
         ```"""
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
@@ -673,24 +950,17 @@ class HunYuanVLForConditionalGeneration(HunYuanVLPreTrainedModel, GenerationMixi
             attentions=outputs.attentions,
         )
 
-    def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
-    ):
-        imgs = kwargs.pop("imgs", None)
-        imgs_pos = kwargs.pop("imgs_pos", None)
-        inputs = super().prepare_inputs_for_generation(
-            input_ids,
-            past_key_values=past_key_values,
-            attention_mask=attention_mask,
-            inputs_embeds=inputs_embeds,
-            **kwargs,
-        )
-
-        if imgs is not None:
-            inputs["imgs"] = imgs
-        if imgs_pos is not None:
-            inputs["imgs_pos"] = imgs_pos
-        return inputs
+    # def prepare_inputs_for_generation(
+    #     self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    # ):
+    #     inputs = super().prepare_inputs_for_generation(
+    #         input_ids,
+    #         past_key_values=past_key_values,
+    #         attention_mask=attention_mask,
+    #         inputs_embeds=inputs_embeds,
+    #         **kwargs,
+    #     )
+    #     return inputs
 
     @torch.no_grad()
     def generate(
@@ -722,10 +992,6 @@ class HunYuanVLForConditionalGeneration(HunYuanVLPreTrainedModel, GenerationMixi
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-        if "eos_token_id" in kwargs:
-            # print(f"kwargs['eos_token_id'] = {kwargs['eos_token_id']}, self.config.eod_token_id = {self.config.eod_token_id}")
-            kwargs["eos_token_id"] = self.config.eod_token_id
-
         return super().generate(
             inputs=input_ids,
             position_ids=position_ids,
@@ -740,8 +1006,7 @@ class HunYuanVLForConditionalGeneration(HunYuanVLPreTrainedModel, GenerationMixi
         self,
         input_ids: torch.LongTensor,
         inputs_embeds: torch.FloatTensor,
-        image_features: Optional[torch.FloatTensor] = None,
-        # video_features: Optional[torch.FloatTensor] = None,
+        image_features: Optional[torch.FloatTensor] = None
     ):
         """
         Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
@@ -754,7 +1019,6 @@ class HunYuanVLForConditionalGeneration(HunYuanVLPreTrainedModel, GenerationMixi
             special_image_mask = special_image_mask.all(-1)
         else:
             special_image_mask = input_ids == self.config.image_token_id
-            # special_video_mask = input_ids == self.config.video_token_id
 
         n_image_tokens = special_image_mask.sum()
         special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -764,229 +1028,6 @@ class HunYuanVLForConditionalGeneration(HunYuanVLPreTrainedModel, GenerationMixi
             )
 
         return special_image_mask, None
-
-
-class HunYuanVisionPatchEmbed(nn.Module):
-    def __init__(self, config: HunYuanVLVisionConfig):
-        super().__init__()
-
-        self.config = config
-        self.embed_dim = config.hidden_size
-        self.image_size = config.max_image_size
-        self.patch_size = config.patch_size
-        self.max_seq_len = config.max_vit_seq_len
-        self.spatial_merge_size = config.spatial_merge_size
-        self.vit_remove_prenorm = True
-
-        self.patch_embedding = nn.Conv2d(
-            in_channels=config.num_channels,
-            out_channels=self.embed_dim,
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
-            bias=True,
-        )
-
-        self.num_patches = (self.image_size // self.patch_size) ** 2
-        self.skip_cls_token = True
-
-        self.interpolate_mode = "bicubic"
-        if 'interpolate_mode' in config.__dict__:
-            self.interpolate_mode = config.interpolate_mode
-
-        # add interpolate_pos_encoding
-        self.num_positions = self.num_patches + 1
-        self.position_ids = torch.arange(self.num_positions).expand((1, -1))
-        self.position_edge = int(math.sqrt(self.num_positions))
-        self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
-
-        if not self.vit_remove_prenorm:
-            self.pre_layernorm = nn.LayerNorm(self.embed_dim, eps=config.rms_norm_eps)
-        else:
-            self.pre_layernorm = None
-
-        self.patch_pos_embed = None
-
-    def forward(self, pixel_values: torch.Tensor, grid_thw: list[list[int]]) -> torch.Tensor:
-        patch_embeds = self.patch_embedding(pixel_values)
-        patch_embeds = patch_embeds.squeeze(-1).squeeze(-1).unsqueeze(0)
-
-        if self.patch_pos_embed is None:
-            patch_pos_shape = (1, self.position_edge, self.position_edge, self.embed_dim)
-            self.patch_pos_embed = self.position_embedding.weight[1:,:].reshape(patch_pos_shape).permute(0, 3, 1, 2).float()
-
-        patch_pos_embed_list = []
-
-        for grid in grid_thw:
-            _, h0, w0 = grid
-            # we add a small number to avoid floating point error in the interpolation
-            # see discussion at https://github.com/facebookresearch/dino/issues/8
-            h0, w0 = h0 + 0.1, w0 + 0.1
-            patch_pos_embed = nn.functional.interpolate(
-                self.patch_pos_embed,
-                scale_factor=((h0 / self.position_edge).item(), (w0 / self.position_edge).item()),
-                mode=self.interpolate_mode,
-                align_corners=False,
-            )
-
-            patch_pos_embed = patch_pos_embed.reshape(self.embed_dim, -1).transpose(0,1).unsqueeze(0).to(patch_embeds.dtype)
-            patch_pos_embed_list.append(patch_pos_embed)
-
-        patch_pos_embed = torch.cat(patch_pos_embed_list, dim=1)
-        embeddings = patch_embeds + patch_pos_embed
-
-        if self.pre_layernorm is not None:
-            embeddings = self.pre_layernorm(embeddings)
-
-        return embeddings
-
-class HunYuanVisionPatchMerger(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        anyres_pooling_size,
-        rms_norm_eps,
-        **kwargs
-    ):
-        super().__init__()
-
-        embed_std = 1 / math.sqrt(out_channels)
-        self.anyres_pooling_size = anyres_pooling_size
-        self.proj = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels * 2, kernel_size=anyres_pooling_size, stride=anyres_pooling_size),
-            nn.GELU(),
-            nn.Conv2d(in_channels * 2, in_channels * 4, kernel_size=1),
-        )
-        self.mlp = nn.Linear(in_channels * 4, out_channels)
-        self.image_newline = nn.Parameter(torch.randn(in_channels * 4) * embed_std)
-
-        self.image_begin = nn.Parameter(torch.randn(out_channels) * embed_std)
-        self.image_end = nn.Parameter(torch.randn(out_channels) * embed_std)
-
-        self.image_sep = nn.Parameter(torch.randn(out_channels) * embed_std)
-
-        self.before_rms = HunYuanVLRMSNorm(in_channels, eps=rms_norm_eps)
-        self.after_rms = HunYuanVLRMSNorm(out_channels, eps=rms_norm_eps)
-
-
-    def forward(self, x, size=(16, 16), x2=None, size2=(16, 16), is_video=False):
-        remove_vit_special_tokens = False
-        learnable_mlp_pooling_size = None
-        x = self.before_rms(x)
-        h, w = size
-        dtype = x.dtype
-        x = x.permute(0, 2, 1).reshape(x.shape[0], -1, int(h.item()), int(w.item()))
-        x = self.proj(x)  # b,c,h,w
-        if is_video:
-            video_avgpool_size = 2
-            stride = 2
-            x = F.avg_pool2d(x, kernel_size=video_avgpool_size, stride=stride)
-        b, c, h, w = x.shape
-        if not remove_vit_special_tokens:
-            x = torch.cat(
-                [x, self.image_newline.reshape(1, c, 1, 1).expand(b, c, h, 1).to(dtype, non_blocking=True)], dim=-1
-            )
-        x = x.reshape(b, c, -1).permute(0, 2, 1)
-        x = self.mlp(x)
-
-        if x2 is not None:
-            h2, w2 = size2
-            x2 = x2.permute(0, 2, 1).reshape(x2.shape[0], -1, h2, w2)
-            x2 = self.proj(x2)
-            b2, c2, h2, w2 = x2.shape
-            if not remove_vit_special_tokens:
-                x2 = torch.cat(
-                    [
-                        x2,
-                        self.image_newline.reshape(1, c2, 1, 1).expand(b2, c2, h2, 1).to(dtype, non_blocking=True),
-                    ],
-                    dim=-1,
-                )
-            x2 = x2.reshape(b2, c2, -1).permute(0, 2, 1)  # b,n,c
-            x2 = self.mlp(x2)
-
-            sep = self.image_sep.reshape(1, 1, -1).expand(b2, 1, x2.shape[-1]).to(dtype, non_blocking=True)
-
-            x = torch.cat([x, sep, x2], dim=1)
-
-        begin = self.image_begin.reshape(1, 1, -1).expand(b, 1, x.shape[-1]).to(dtype, non_blocking=True)
-        end = self.image_end.reshape(1, 1, -1).expand(b, 1, x.shape[-1]).to(dtype, non_blocking=True)
-        x = torch.cat([begin, x, end], dim=1)
-
-        return self.after_rms(x)
-
-
-# @auto_docstring # TODO Fix it
-class HunYuanVisionTransformer(nn.Module):
-    config: HunYuanVLVisionConfig
-    def __init__(self, config: HunYuanVLVisionConfig):
-        super().__init__()
-        self.config = config
-
-        # ---- 1. Patch Embedding ----
-        self.embeddings = HunYuanVisionPatchEmbed(config)
-
-        # ---- 2. Transformer Layers ----
-        # TODO: Fix config from vision config
-        config.use_rotary_pos_emb = False
-        config.use_qk_norm = False
-        config.norm_type = 'torch_nn'
-        config.attention_bias = True
-        config.mlp_bias = True
-
-        self.layers = nn.ModuleList(
-            [HunYuanVLDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-
-        # ---- 3. Perception / Adapter Module ----
-        self.perceive = HunYuanVisionPatchMerger(
-            self.config.hidden_size,
-            self.config.text_hidden_size,
-            self.config.anyres_pooling_size,
-            self.config.rms_norm_eps,
-        )
-
-    def get_activation_function(self, act_name: str):
-        act_map = {
-            "gelu": nn.GELU(),
-            "relu": nn.ReLU(),
-            "silu": nn.SiLU(),
-        }
-        return act_map.get(act_name.lower(), nn.GELU()) # default GELU
-
-    # @auto_docstring # TODO Fix it
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        grid_thw: List[List[int]],
-    ) -> torch.Tensor:
-        #
-        r"""
-        grid_thw (`torch.LongTensor` of shape `(num_images, 3)`):
-            The temporal, height and width dimensions of feature shape for each image. Each row contains [t, h, w] values.
-        """
-        hidden_states = self.embeddings(hidden_states, grid_thw)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states)
-
-        cu_seqlens: list = [0]
-        for t, h, w in grid_thw:
-            cu_seqlens.append((h * w).item())
-
-        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
-        cu_seqlens = torch.cumsum(cu_seqlens, dim=0, dtype=torch.int32)
-        split_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        split_items = torch.split(hidden_states, split_lengths, dim=1)
-
-        processed_items = []
-        for grid, item in zip(grid_thw, split_items):
-            t, h, w = grid
-            processed = self.perceive(item, size=(h, w))
-            processed_items.append(processed)
-
-        hidden_states = torch.cat(processed_items, dim=1)
-
-        return hidden_states
 
 
 __all__ = [

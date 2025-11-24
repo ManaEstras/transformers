@@ -33,15 +33,25 @@ class HunYuanVLVisionConfig(PretrainedConfig):
         intermediate_size=4304,
         interpolate_mode="bilinear",
         rms_norm_eps=1e-05,
+        learnable_mlp_pooling_size=0,
         num_attention_heads=16,
+        num_key_value_heads=None,
         num_channels=3,
         num_hidden_layers=27,
         out_hidden_size=4096,
         patch_size=16,
+        remove_prenorm=True,
         spatial_merge_size=2,
         temporal_patch_size=1,
-        min_image_size=512,
+        resize_resolution=2048,
+        img_max_token_num=4096,
         max_image_size=2048,
+        video_max_image_size=768,
+        video_min_image_size=256,
+        min_image_size=512,
+        anyres_vit_max_image_size=2048,
+        max_vit_seq_len=16384,
+        text_hidden_size=3072,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -50,16 +60,30 @@ class HunYuanVLVisionConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.interpolate_mode = interpolate_mode
+        self.learnable_mlp_pooling_size = learnable_mlp_pooling_size
         self.num_attention_heads = num_attention_heads
+        if not num_key_value_heads:
+            self.num_key_value_heads = num_attention_heads
+        else:
+            self.num_key_value_heads = num_key_value_heads
         self.num_channels = num_channels
         self.num_hidden_layers = num_hidden_layers
         self.out_hidden_size = out_hidden_size
         self.patch_size = patch_size
-
-        self.rms_norm_eps= rms_norm_eps
+        self.remove_prenorm = remove_prenorm
         self.spatial_merge_size = spatial_merge_size
+        self.temporal_patch_size = temporal_patch_size
+        self.rms_norm_eps = rms_norm_eps
+
+        self.resize_resolution = resize_resolution
+        self.img_max_token_num = img_max_token_num
         self.max_image_size = max_image_size
         self.min_image_size = min_image_size
+        self.video_max_image_size = video_max_image_size
+        self.video_min_image_size = video_min_image_size
+        self.anyres_vit_max_image_size = anyres_vit_max_image_size
+        self.max_vit_seq_len = max_vit_seq_len
+        self.text_hidden_size = text_hidden_size
 
 
 class HunYuanVLTextConfig(PretrainedConfig):
@@ -91,7 +115,7 @@ class HunYuanVLTextConfig(PretrainedConfig):
             `num_key_value_heads=1 the model will use Multi Query Attention (MQA) otherwise GQA is used. When
             converting a multi-head checkpoint to a GQA checkpoint, each group key and value head should be constructed
             by meanpooling all the original heads within that group. For more details checkout [this
-            paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to
+            paper](https://huggingface.co/papers/2305.13245). If it is not specified, will default to
             `num_attention_heads`.
         hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
             The non-linear activation function (function or string) in the decoder.
@@ -246,7 +270,7 @@ class HunYuanVLConfig(PretrainedConfig):
     ):
         # We need to init super() here so that it does not reset values
         # that are in text config to the BaseClass defaults. The Base
-        # config has many text related defaults and not all defaults are same as for `Qwen2_5_VLTextConfig`
+        # config has many text related defaults and not all defaults are same as for `HunYuanVLTextConfig`
         super().__init__(**kwargs)
 
         if isinstance(vision_config, dict):
