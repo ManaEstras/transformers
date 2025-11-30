@@ -723,7 +723,7 @@ class HunYuanVLPreTrainedModel(PreTrainedModel):
 
 
 @auto_docstring
-class HunYuanVLModel(HunYuanVLPreTrainedModel):
+class HunYuanVLTextModel(HunYuanVLPreTrainedModel):
     def __init__(self, config: Union[HunYuanVLConfig, HunYuanVLTextConfig]):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -801,7 +801,7 @@ class HunYuanVLForCausalLM(HunYuanVLPreTrainedModel, GenerationMixin):
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = HunYuanVLModel(config)
+        self.model = HunYuanVLTextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -875,7 +875,7 @@ class HunYuanVLForConditionalGeneration(HunYuanVLPreTrainedModel, GenerationMixi
 
     def __init__(self, config: HunYuanVLConfig):
         super().__init__(config)
-        self.model = HunYuanVLModel(config)
+        self.model = HunYuanVLTextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.vit = HunYuanVisionTransformer(config.vision_config)
@@ -1002,7 +1002,6 @@ class HunYuanVLForConditionalGeneration(HunYuanVLPreTrainedModel, GenerationMixi
         inputs_embeds = self.model.embed_tokens(input_ids)
 
         if self.vit is not None and pixel_values is not None:
-            pixel_values = pixel_values.to(torch.bfloat16)
             image_embeds = self.vit(pixel_values, image_grid_thw)
 
             # ViT may be deployed on different GPUs from those used by LLMs, due to auto-mapping of accelerate.
@@ -1054,7 +1053,7 @@ class HunYuanVLForConditionalGeneration(HunYuanVLPreTrainedModel, GenerationMixi
 __all__ = [
     "HunYuanVLForConditionalGeneration",
     "HunYuanVLForCausalLM",
-    "HunYuanVLModel",
+    "HunYuanVLTextModel",
     "HunYuanVLPreTrainedModel",
     "HunYuanVLTextModel",
 ]
