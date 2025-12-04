@@ -58,3 +58,22 @@
 - Talker -> 单独加载用于生成语音 token；与 Thinker 输出的文本或中间回复一致对齐 TTS token 协议。
 - Token2Wav -> 与 Talker 的 codec 维度匹配；DiT/BigVGAN 参数需与训练一致。
 
+## 类级属性与加载行为（Class Attributes & Loading）
+
+- `model_type`
+  - 每个配置类声明唯一 `model_type`（如 `qwen2_5_omni_thinker`、`qwen2_5_omni_talker`、`qwen2_5_omni_dit` 等），用于注册与 `AutoConfig/AutoModel` 的映射。
+  - `from_pretrained` 会依据 `config.json` 中的 `model_type` 选择正确的模型实现类与权重装载路径。
+- `attribute_map`
+  - 在 `Qwen2_5OmniThinkerConfig` 中将通用别名映射到真实字段（如 `image_token_id → image_token_index`），提升向后兼容性。
+  - 加载旧版本配置或模型卡时，`from_pretrained` 自动应用映射避免字段缺失。
+- `sub_configs`
+  - `ThinkerConfig` 支持以 dict 或具体子配置类传入 `audio_config`/`vision_config`/`text_config`，并在构造函数中统一实例化。
+  - 当模型卡内嵌子配置时，`from_pretrained` 直接解析并构造对应子模块，确保多模态分支参数一致。
+- RoPE 与滑窗相关类级参数
+  - `rope_scaling`、`use_sliding_window`、`sliding_window`、`max_window_layers`、`layer_types` 等在加载时决定位置编码与注意力策略；
+  - 若未显式提供，构造函数会根据 `num_hidden_layers` 自动填充 `layer_types` 并进行校验（`layer_type_validation`）。
+- 初始化范围
+  - `initializer_range` 等权重初始化超参在模型构建时生效；通过 `from_pretrained` 加载已训练权重时通常不影响权重值，但会影响随机初始化分支（例如新增未训练头）。
+- 与 Processor 的交互
+  - 配置中的特殊 token 索引（image/audio/video/TTS）需要与 `Qwen2_5OmniProcessor` 保持一致，处理器在构造多模态序列时依赖这些索引；
+  - `ProcessorMixin.from_pretrained` 会加载 `preprocessor_config.json` 并与此处配置协同工作，确保 `model_input_names` 字段约定维持一致。

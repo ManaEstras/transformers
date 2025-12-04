@@ -61,3 +61,19 @@
 - Past Key Values：
   - `ForConditionalGeneration` 类统一支持增量生成；注意在多模态下正确缓存与复用。
 
+## 类级属性与加载行为（Class Attributes & Loading）
+
+- `model_type` 与自动映射
+  - 模型实现与配置的 `model_type` 一致（如 Thinker/Talker/Token2Wav 各自的 `model_type`），通过 Transformers 的注册系统与 `AutoModel` 系列建立对应关系。
+  - `from_pretrained` 加载时读取 `config.json` 的 `model_type`，据此解析权重文件与模型类路径。
+- 继承基类影响
+  - `Qwen2_5OmniPreTrainedModelForConditionalGeneration`/`PreTrainedModel` 提供统一的权重初始化、权重命名解析以及 `generate` 能力；
+  - 基类还定义了设备迁移、`tie_weights`、部分指标缓存等行为，影响增量生成与多设备场景下的加载稳定性。
+- 输入契约与 `model_input_names`
+  - 虽然 `model_input_names` 在处理器中声明，但建模侧 `forward`/`generate` 对这些字段有严格依赖：如 `image_grid_thw` 与 3D RoPE 索引构造、`video_second_per_grid` 与 4D 掩码时间维度、`audio_feature_lengths` 与音频掩码；
+  - 在 `from_pretrained` 后，保持处理器与模型的字段一致至关重要，建议配套使用同一模型卡的 Processor。
+- RoPE/滑窗行为由配置驱动
+  - `rope_scaling`、`use_sliding_window` 等类级参数（源自 Config）在模型构造时决定注意力形态与位置编码；
+  - `layer_types` 在加载时决定每层使用 `sliding_attention` 或 `full_attention`，影响增量生成的窗口与性能。
+- 权重初始化范围
+  - `initializer_range` 等超参会在模型实例化时影响未加载的模块或新增头部的初始化；对已加载权重不做数值修改，但影响扩展实验的稳定性。

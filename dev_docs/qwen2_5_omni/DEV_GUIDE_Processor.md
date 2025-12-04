@@ -50,3 +50,17 @@
 - 当调整分辨率：
   - 同步修改 `size.shortest_edge/longest_edge` 与 `min_pixels/max_pixels`，并评估 `merge_size` 对 token 数与显存的影响。
 
+## 类级属性与加载行为（Class Attributes & Loading）
+
+- `ProcessorMixin` 继承行为
+  - `Qwen2_5OmniProcessor` 继承自 `ProcessorMixin`，拥有统一的 `from_pretrained` 加载机制：读取 `preprocessor_config.json`（或对应目录的处理器配置），并合并传入的 `kwargs`（如 `videos_kwargs`、`images_kwargs`）。
+  - 通过 `save_pretrained` 可将当前处理器的参数写回到磁盘，供下次 `from_pretrained` 复用。
+- `model_input_names`
+  - 处理器声明并维护与模型加载一致的输入字段名集合（如 `input_ids`、`attention_mask`、`position_ids`、`image_grid_thw`、`video_grid_thw`、`video_second_per_grid`、`input_features`、`feature_attention_mask`、`audio_feature_lengths`）。
+  - 模型侧在 `forward`/`generate` 中依赖这些字段，`Processor` 的设计确保 `from_pretrained` 后字段契约稳定。
+- 模板与特殊 token 协议
+  - `apply_chat_template` 的默认模板与是否强制启用（`force_enable_chat_template`）在处理器配置中体现；加载时若模板缺失或版本不一致，处理器将提供向后兼容策略。
+  - `replace_multimodal_special_tokens` 在加载后保持与配置中的特殊 token 索引一致：例如 `image_token_index`、`video_token_index`、`audio_start/end_token_id`、`tts_*` 系列索引。
+- `from_pretrained` 交互要点
+  - 当模型与处理器来自同一模型卡时，推荐分别调用 `from_pretrained` 以确保配置与预处理同步；
+  - 若自定义了 `videos_kwargs`/`images_kwargs`/`processor_kwargs`，传入的值会覆盖磁盘配置，适合做实验性调优但需与模型配置（如 `patch_size`、`temporal_patch_size`）保持一致。
