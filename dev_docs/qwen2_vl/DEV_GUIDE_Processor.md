@@ -30,7 +30,7 @@
     - 根据每个图/视频的 patch 数（由 `get_number_of_*_patches` 计算）：
       - 在原始文本中将 `<|image_pad|>`/`<|video_pad|>` 替换为等量的占位符（使用相应的 pad token）；
     - 调用 tokenizer 处理替换后的文本，得到 `input_ids`/`attention_mask`；
-    - 打包所有字段返回。
+    - 通过 `BatchFeature` 打包所有字段返回。
   - 输出：
     - 文本：`input_ids`, `attention_mask`；
     - 视觉：`pixel_values`, `image_grid_thw`；`pixel_values_videos`, `video_grid_thw`；
