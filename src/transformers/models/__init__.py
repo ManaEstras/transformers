@@ -190,6 +190,8 @@ if TYPE_CHECKING:
     from .hubert import *
     from .hunyuan_v1_dense import *
     from .hunyuan_v1_moe import *
+    from .hunyuan_vl import *
+    from .hunyuan_vl_mot import *
     from .ibert import *
     from .idefics import *
     from .idefics2 import *
