@@ -4,7 +4,7 @@
 #             the file from the modular. If any change should be done, please apply the change to the
 #                          modular_hunyuan_vl.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
-# Copyright (C) 2025 THL A29 Limited, a Tencent company and the HuggingFace Inc. team. All rights reserved.
+# Copyright (C) 2026 THL A29 Limited, a Tencent company and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -103,10 +103,10 @@ class HunYuanVLVisionConfig(PreTrainedConfig):
     custom_intro="""
     Text backbone configuration for the dense-only, image-text HunYuanVL open-source variant.
 
-    Inherits the standard fields from [`HunYuanDenseV1Config`] and adds a few legacy aliases that some Tencent
-    checkpoints persist on disk (`pad_id`, `attention_head_dim`, `rope_scaling`, `rope_theta`). Those legacy fields are
-    normalized into the canonical `pad_token_id` / `head_dim` / `rope_parameters` slots in `__post_init__` so the rest
-    of the model only ever needs to read the canonical fields.
+    Inherits the standard fields from [`HunYuanDenseV1Config`]. A few legacy field names that some Tencent checkpoints
+    persist on disk (`pad_id`, `attention_head_dim`, `org_vocab_size`) are exposed as `attribute_map` aliases that
+    transparently redirect to the canonical `pad_token_id` / `head_dim` / `vocab_size` slots. The legacy `rope_scaling`
+    / `rope_theta` keys are folded into the standardized `rope_parameters` dict by `convert_rope_params_to_dict`.
     """,
     checkpoint="tencent/HunyuanOCR",
 )
@@ -118,18 +118,6 @@ class HunYuanVLTextConfig(PreTrainedConfig):
         here so the auto-generated docstring stays in sync.
     sep_token_id (`int`, *optional*, defaults to 4):
         Token id used as a separator marker by HunYuan tokenizers.
-    rope_scaling (`dict`, *optional*):
-        Legacy RoPE scaling payload from Tencent checkpoints. When provided, it is normalized into `rope_parameters`
-        (and the equivalent `xdrope` rope type is rewritten to `dynamic`).
-    rope_theta (`float`, *optional*, defaults to 10000.0):
-        Legacy alias preserved for compatibility with checkpoints that persist a top-level rope theta. The value is
-        merged into `rope_parameters` during normalization.
-    pad_id (`int`, *optional*):
-        Legacy padding token field. When `pad_token_id` is unset or `-1`, this value is normalized into `pad_token_id`.
-    attention_head_dim (`int`, *optional*):
-        Legacy alias for `head_dim`. When `head_dim` is not provided, this value is used as the per-head hidden size.
-    org_vocab_size (`int`, *optional*):
-        Original vocabulary size recorded in exported checkpoints for compatibility with Tencent tooling.
     tie_word_embeddings (`bool`, *optional*, defaults to `True`):
         Whether to tie the input and output word embeddings.
     use_qk_norm (`bool`, *optional*, defaults to `False`):
@@ -165,6 +153,15 @@ class HunYuanVLTextConfig(PreTrainedConfig):
     attention_dropout: float | int = 0.0
     head_dim: int | None = None
     base_config_key = "text_config"
+    # Legacy Tencent-export config keys -> canonical field names. ``attribute_map`` is a pure key alias, so reading or
+    # writing the legacy name transparently redirects to the canonical attribute (see `PreTrainedConfig.__setattr__`).
+    attribute_map = {
+        "pad_id": "pad_token_id",
+        "attention_head_dim": "head_dim",
+        "org_vocab_size": "vocab_size",
+    }
+    # ``xdrope`` carries scaling knobs (alpha/beta/mscale) and a section layout that the generic rope validator does
+    # not know about; whitelist them so validation does not raise (the rope type is standardized to ``dynamic``).
     ignore_keys_at_rope_validation = {
         "alpha",
         "beta_fast",
@@ -175,69 +172,43 @@ class HunYuanVLTextConfig(PreTrainedConfig):
     }
 
     sep_token_id: int | None = 4
-    rope_scaling: dict | None = None
-    rope_theta: float = 10000.0
-    pad_id: int | None = None
-    attention_head_dim: int | None = None
-    org_vocab_size: int | None = None
     use_qk_norm: bool = False
     use_cla: bool = False
     enable_lm_head_fp32: bool = False
 
     def __post_init__(self, **kwargs):
-        # Translate legacy aliases into canonical fields before invoking the standard validation.
-        if self.head_dim is None and self.attention_head_dim is not None:
-            self.head_dim = self.attention_head_dim
-        if self.pad_token_id == -1 and self.pad_id not in (None, -1):
-            self.pad_token_id = self.pad_id
-
-        # Only normalize rope payloads when a legacy ``rope_scaling`` blob was provided. Otherwise let the parent
-        # ``HunYuanDenseV1Config.__post_init__`` (and its ``standardize_rope_params`` helper) populate
-        # ``rope_parameters`` itself, which keeps the canonical ``{rope_theta, rope_type}`` shape consistent across
-        # save / reload cycles.
-        if self.rope_scaling is not None:
-            rope_parameters = self._normalize_rope_parameters(
-                getattr(self, "rope_parameters", None),
-                self.rope_scaling,
-                self.rope_theta,
-            )
-            if rope_parameters is not None:
-                self.rope_parameters = rope_parameters
-                self.rope_scaling = rope_parameters
-                self.rope_theta = rope_parameters["rope_theta"]
+        # Some Tencent checkpoints persist both ``pad_id`` (the real id) and ``pad_token_id: -1`` (a sentinel). Because
+        # ``pad_id`` is now an ``attribute_map`` alias of ``pad_token_id`` the two collide, so explicitly prefer the
+        # real value when the canonical slot still holds the ``-1`` sentinel.
+        pad_id = kwargs.pop("pad_id", None)
+        if self.pad_token_id == -1 and pad_id not in (None, -1):
+            self.pad_token_id = pad_id
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         super().__post_init__(**kwargs)
 
-    @staticmethod
-    def _normalize_rope_parameters(
-        rope_parameters: dict | None,
-        rope_scaling: dict | None,
-        rope_theta: float,
-    ) -> dict | None:
-        if rope_parameters is None and rope_scaling is None:
-            return None
-        if rope_parameters is None:
-            rope_parameters = dict(rope_scaling)
-        else:
-            rope_parameters = dict(rope_parameters)
-
-        rope_type = rope_parameters.get("rope_type", rope_parameters.get("type", "default"))
+    def convert_rope_params_to_dict(self, **kwargs):
+        # Fold the legacy ``rope_scaling`` / ``rope_theta`` keys into the standardized ``rope_parameters`` dict and
+        # rewrite HunYuan's ``xdrope`` rope type to the generic ``dynamic`` type the runtime understands. Always
+        # produce a populated ``rope_parameters`` (defaulting to a plain ``default`` rope) so the rotary embedding
+        # always has a ``rope_type`` to read, matching the base config behavior.
+        rope_scaling = kwargs.pop("rope_scaling", None)
+        self.rope_parameters = rope_scaling or self.rope_parameters or {}
+        self.rope_parameters = dict(self.rope_parameters)
+        rope_type = self.rope_parameters.get("rope_type", self.rope_parameters.get("type", "default"))
         if rope_type == "xdrope":
             rope_type = "dynamic"
-        rope_parameters["rope_type"] = rope_type
-        # Mirror the rope type under the legacy ``type`` key so checkpoints exported with either spelling continue
-        # to round-trip without losing information.
-        rope_parameters["type"] = rope_type
-        rope_parameters.setdefault("rope_theta", rope_theta)
-        return rope_parameters
-
-    def _rope_parameters_validation(self):
-        # Skip rope validation when no rope payload was provided so minimal configs continue to work.
-        if getattr(self, "rope_parameters", None) is None and getattr(self, "rope_scaling", None) is None:
-            return
+        self.rope_parameters["rope_type"] = rope_type
+        self.rope_parameters.setdefault("rope_theta", kwargs.pop("rope_theta", self.default_theta))
         self.standardize_rope_params()
-        self.validate_rope()
+        return kwargs
+
+    @property
+    def xdrope_num_sections(self) -> int:
+        """Number of position-id channels used by xdrope (e.g. 4 for `[text, w, h, t]`)."""
+        rope_parameters = getattr(self, "rope_parameters", None) or {}
+        xdrope_section = rope_parameters.get("xdrope_section")
+        return len(xdrope_section) if xdrope_section else 4
 
 
 @auto_docstring(
@@ -282,6 +253,12 @@ class HunYuanVLConfig(PreTrainedConfig):
     model_type = "hunyuan_vl"
     sub_configs = {"vision_config": HunYuanVLVisionConfig, "text_config": HunYuanVLTextConfig}
     keys_to_ignore_at_inference = ["past_key_values"]
+    # Legacy Tencent-export config keys -> canonical field names (released config.json uses the longer spellings).
+    attribute_map = {
+        "image_start_token_id": "im_start_id",
+        "image_end_token_id": "im_end_id",
+        "image_newline_token_id": "im_newline_id",
+    }
 
     text_config: dict | PreTrainedConfig | None = None
     vision_config: dict | PreTrainedConfig | None = None
@@ -311,12 +288,6 @@ class HunYuanVLConfig(PreTrainedConfig):
         # Keep the vision tower in sync with the consuming text backbone size.
         self.vision_config.text_hidden_size = self.text_config.hidden_size
 
-        # Propagate text-side identifiers to the top-level config so generic generation utilities can read them.
-        kwargs.setdefault("pad_token_id", self.text_config.pad_token_id)
-        kwargs.setdefault("bos_token_id", self.text_config.bos_token_id)
-        kwargs.setdefault("eos_token_id", self.text_config.eos_token_id)
-        kwargs.setdefault("tie_word_embeddings", self.text_config.tie_word_embeddings)
-
         super().__post_init__(**kwargs)
 
     @classmethod
@@ -325,9 +296,16 @@ class HunYuanVLConfig(PreTrainedConfig):
         Pop and return the subset of ``kwargs`` that should be forwarded to [`HunYuanVLTextConfig`].
 
         Required to support legacy Tencent checkpoints whose ``config.json`` stores the text-backbone fields at the
-        top level instead of inside a nested ``text_config`` block.
+        top level instead of inside a nested ``text_config`` block. Besides the canonical text fields, this also
+        captures the legacy alias keys (`pad_id` / `attention_head_dim` / `org_vocab_size`) and the legacy rope keys
+        (`rope_scaling` / `rope_theta`) so they reach the text config where they are normalized.
         """
-        text_keys = set(cls.sub_configs["text_config"].__dataclass_fields__) | {"rope_scaling", "rope_theta"}
+        text_cfg = cls.sub_configs["text_config"]
+        text_keys = (
+            set(text_cfg.__dataclass_fields__)
+            | set(getattr(text_cfg, "attribute_map", {}))
+            | {"rope_scaling", "rope_theta"}
+        )
         return {key: kwargs.pop(key) for key in list(kwargs) if key in text_keys}
 
 

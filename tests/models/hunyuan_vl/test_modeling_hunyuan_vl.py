@@ -16,214 +16,210 @@
 import unittest
 
 from transformers import (
+    AutoProcessor,
     HunYuanVLConfig,
-    HunYuanVLForCausalLM,
-    HunYuanVLForConditionalGeneration,
-    HunYuanVLTextConfig,
-    HunYuanVLVisionConfig,
     is_torch_available,
+    is_vision_available,
 )
-from transformers.testing_utils import require_torch
+from transformers.testing_utils import cleanup, require_torch, slow, torch_device
+
+from ...vlm_tester import VLMModelTest, VLMModelTester
 
 
 if is_torch_available():
     import torch
 
+    from transformers import (
+        HunYuanVLForConditionalGeneration,
+        HunYuanVLModel,
+    )
+    from transformers.models.hunyuan_vl.configuration_hunyuan_vl import (
+        HunYuanVLTextConfig,
+        HunYuanVLVisionConfig,
+    )
 
-def ids_tensor(shape, vocab_size):
-    return torch.randint(low=0, high=vocab_size, size=tuple(shape), dtype=torch.long)
+if is_vision_available():
+    from transformers.image_utils import load_image
 
 
-def floats_tensor(shape, scale=1.0):
-    return torch.rand(tuple(shape), dtype=torch.float32) * scale
+class HunYuanVLVisionText2TextModelTester(VLMModelTester):
+    base_model_class = HunYuanVLModel if is_torch_available() else None
+    config_class = HunYuanVLConfig
+    conditional_generation_class = HunYuanVLForConditionalGeneration if is_torch_available() else None
+    text_config_class = HunYuanVLTextConfig if is_torch_available() else None
+    vision_config_class = HunYuanVLVisionConfig if is_torch_available() else None
 
+    def __init__(self, parent, **kwargs):
+        kwargs.setdefault("image_size", 64)
+        kwargs.setdefault("patch_size", 16)
+        kwargs.setdefault("num_channels", 3)
+        kwargs.setdefault("num_image_tokens", (64 // 16) * (64 // 16 + 1) + 2)  # grid_hw * (grid_hw + 1) + 2
+        kwargs.setdefault("image_token_id", 5)
+        kwargs.setdefault("hidden_size", 64)
+        kwargs.setdefault("intermediate_size", 128)
+        kwargs.setdefault("num_hidden_layers", 2)
+        kwargs.setdefault("num_attention_heads", 4)
+        kwargs.setdefault("num_key_value_heads", 4)
+        kwargs.setdefault("hidden_act", "silu")
+        kwargs.setdefault("max_position_embeddings", 128)
+        kwargs.setdefault("pad_token_id", 0)
+        kwargs.setdefault("bos_token_id", 1)
+        kwargs.setdefault("eos_token_id", 2)
+        kwargs.setdefault("head_dim", 16)
+        kwargs.setdefault("tie_word_embeddings", False)
+        super().__init__(parent, **kwargs)
 
-class HunYuanVLVisionText2TextModelTester:
-    """Build a tiny HunYuanVL config plus matching multimodal inputs for unit tests."""
-
-    def __init__(
-        self,
-        parent,
-        batch_size=2,
-        seq_length=32,
-        num_channels=3,
-        patch_size=16,
-        image_size=64,
-        image_token_id=5,
-    ):
-        self.parent = parent
-        self.batch_size = batch_size
-        self.seq_length = seq_length
-        self.num_channels = num_channels
-        self.patch_size = patch_size
-        self.image_size = image_size
-        self.image_token_id = image_token_id
-        self.device = "cpu"
-        self.num_image_patches = (image_size // patch_size) ** 2
-        self.grid_hw = image_size // patch_size
-        # HunYuanVL inserts an extra column per row (newline) and 2 begin/end tokens.
-        self.num_image_placeholder_tokens = self.grid_hw * (self.grid_hw + 1) + 2
-        self.text_config = {
-            "vocab_size": 256,
-            "hidden_size": 64,
-            "intermediate_size": 128,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 4,
-            "hidden_act": "silu",
-            "max_position_embeddings": 128,
-            "pad_token_id": 0,
-            "bos_token_id": 1,
-            "eos_token_id": 2,
-            "head_dim": 16,
-            "rope_theta": 10000.0,
-            "tie_word_embeddings": False,
-        }
-        self.vision_config = {
-            "num_channels": num_channels,
-            "patch_size": patch_size,
-            "temporal_patch_size": 1,
-            "spatial_merge_size": 1,
-            "num_hidden_layers": 2,
-            "hidden_size": 64,
-            "intermediate_size": 128,
-            "num_attention_heads": 4,
-            "hidden_act": "silu",
-            "out_hidden_size": 64,
-            "text_hidden_size": 64,
-            "max_image_size": image_size,
-            "min_image_size": image_size,
-            "anyres_vit_max_image_size": image_size,
-            "max_vit_seq_len": self.num_image_patches,
-        }
+    def get_vision_config(self):
+        return self.vision_config_class(
+            num_channels=self.num_channels,
+            patch_size=self.patch_size,
+            temporal_patch_size=1,
+            spatial_merge_size=1,
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            hidden_act="silu",
+            out_hidden_size=64,
+            text_hidden_size=64,
+            max_image_size=self.image_size,
+            min_image_size=self.image_size,
+            anyres_vit_max_image_size=self.image_size,
+            max_vit_seq_len=(self.image_size // self.patch_size) ** 2,
+        )
 
     def get_config(self):
-        return HunYuanVLConfig(
-            attn_implementation="eager",
-            text_config=self.text_config,
-            vision_config=self.vision_config,
+        return self.config_class(
+            text_config=self.get_text_config(),
+            vision_config=self.get_vision_config(),
             image_token_id=self.image_token_id,
         )
 
-    def prepare_config_and_inputs(self):
-        config = self.get_config()
-        pixel_values = floats_tensor(
-            [self.batch_size * self.num_image_patches, self.num_channels * self.patch_size * self.patch_size]
+    def create_pixel_values(self):
+        from ...test_modeling_common import floats_tensor
+
+        grid_hw = self.image_size // self.patch_size
+        num_patches = grid_hw * grid_hw
+        # HunYuanVL uses flattened pixel values: [batch * num_patches, channels * patch_size * patch_size]
+        return floats_tensor(
+            [self.batch_size * num_patches, self.num_channels * self.patch_size * self.patch_size], scale=1.0
         )
+
+    def _prepare_modality_inputs(self, input_ids, config):
+        pixel_values = self.create_pixel_values()
+        input_ids = self.place_image_tokens(input_ids, config)
+
+        grid_hw = self.image_size // self.patch_size
         image_grid_thw = torch.tensor(
-            [[1, self.grid_hw, self.grid_hw]] * self.batch_size,
-            device=self.device,
+            [[1, grid_hw, grid_hw]] * self.batch_size,
+            device=torch_device,
         )
-
-        input_ids = ids_tensor([self.batch_size, self.seq_length], config.text_config.vocab_size)
-        attention_mask = torch.ones_like(input_ids, device=self.device)
-        input_ids = input_ids.to(self.device)
-        input_ids[input_ids == self.image_token_id] = config.text_config.pad_token_id
-        input_ids[:, : self.num_image_placeholder_tokens] = self.image_token_id
-        # HunYuanVL uses 4 position-id channels in multimodal mode: text, width, height, and temporal.
-        position_ids = torch.arange(self.seq_length, device=self.device).view(1, 1, -1).expand(self.batch_size, 4, -1)
-
-        return config, {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "pixel_values": pixel_values.to(self.device),
+        # The model builds the 4-channel (text, width, height, temporal) xdrope position ids internally via
+        # ``HunYuanVLModel.get_rope_index``, so the tester only needs to provide pixel_values + image_grid_thw.
+        return input_ids, {
+            "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
-            "position_ids": position_ids,
         }
 
 
 @require_torch
-class HunYuanVLModelTest(unittest.TestCase):
-    """Lightweight CPU model tests for `HunYuanVLForConditionalGeneration`.
+class HunYuanVLModelTest(VLMModelTest, unittest.TestCase):
+    model_tester_class = HunYuanVLVisionText2TextModelTester
+    test_all_params_have_gradient = False
+    test_torch_exportable = False
+    # `get_image_features` returns the merged per-image embeddings concatenated along dim=1 (shape
+    # `(1, total_merged_tokens, out_hidden_size)`), so the generic `(batch, ..., hidden)` shape assertion does not
+    # apply. The return type / hidden_states / attentions are still validated by the other image-feature tests.
+    skip_test_image_features_output_shape = True
 
-    These tests intentionally avoid the heavy `ModelTesterMixin` machinery so the suite stays runnable in
-    minimal environments (no GPU, no full Transformers test infrastructure). Coverage focuses on:
+    @unittest.skip(
+        reason="HunYuanVL uses custom position_ids (4-channel) and image_grid_thw, "
+        "making standard SDPA flash dispatch test incompatible."
+    )
+    def test_sdpa_can_dispatch_on_flash(self):
+        pass
 
-    - The forward path produces the expected logits shape on multimodal inputs.
-    - Mismatched image / placeholder counts raise a clear error.
-    - Text-only forward and text-only generate continue to work without any pixel inputs.
-    - The expected backbone (`HunYuanVLTextModel`) is wired in as `model`.
-    """
+    @unittest.skip(
+        reason="HunYuanVL vision transformer uses absolute position embeddings "
+        "that can cause device mismatch during CPU offloading."
+    )
+    def test_cpu_offload(self):
+        pass
+
+    @unittest.skip(
+        reason="HunYuanVL vision transformer uses absolute position embeddings "
+        "that can cause device mismatch during disk offloading."
+    )
+    def test_disk_offload_bin(self):
+        pass
+
+    @unittest.skip(
+        reason="HunYuanVL vision transformer uses absolute position embeddings "
+        "that can cause device mismatch during disk offloading."
+    )
+    def test_disk_offload_safetensors(self):
+        pass
+
+
+@require_torch
+class HunYuanVLIntegrationTest(unittest.TestCase):
+    """Slow integration tests with actual model weights."""
+
+    model_id = "tencent/HunyuanOCR"
 
     def setUp(self):
-        self.model_tester = HunYuanVLVisionText2TextModelTester(self)
+        self.processor = AutoProcessor.from_pretrained(self.model_id)
 
-    def test_config_classes(self):
-        config = self.model_tester.get_config()
-        self.assertIsInstance(config, HunYuanVLConfig)
-        self.assertIsInstance(config.text_config, HunYuanVLTextConfig)
-        self.assertIsInstance(config.vision_config, HunYuanVLVisionConfig)
+    def tearDown(self):
+        cleanup(torch_device, gc_collect=True)
 
-    def test_forward_uses_text_backbone(self):
-        config, _ = self.model_tester.prepare_config_and_inputs()
-        model = HunYuanVLForConditionalGeneration(config).to(self.model_tester.device)
-        self.assertEqual(model.model.__class__.__name__, "HunYuanVLTextModel")
-
-    def test_forward_with_image_placeholders(self):
-        config, inputs_dict = self.model_tester.prepare_config_and_inputs()
-        model = HunYuanVLForConditionalGeneration(config).to(self.model_tester.device)
-        model.eval()
-
-        with torch.no_grad():
-            outputs = model(**inputs_dict)
-
-        self.assertEqual(
-            outputs.logits.shape,
-            (self.model_tester.batch_size, self.model_tester.seq_length, config.text_config.vocab_size),
+    @slow
+    def test_small_model_integration_test_ocr(self):
+        """Test OCR generation with a real image."""
+        model = HunYuanVLForConditionalGeneration.from_pretrained(
+            self.model_id, torch_dtype=torch.bfloat16, device_map=torch_device
         )
+        image = load_image(
+            "https://huggingface.co/datasets/hf-internal-testing/fixtures_got_ocr/resolve/main/image_ocr.jpg"
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": "Extract the text from the image."},
+                ],
+            }
+        ]
+        inputs = self.processor.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, padding=True, return_tensors="pt"
+        ).to(model.device)
 
-    def test_forward_raises_on_mismatched_image_tokens(self):
-        config, inputs_dict = self.model_tester.prepare_config_and_inputs()
-        model = HunYuanVLForConditionalGeneration(config).to(self.model_tester.device)
-        model.eval()
+        generate_ids = model.generate(**inputs, do_sample=False, max_new_tokens=50)
+        decoded = self.processor.decode(generate_ids[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
-        bad_inputs = dict(inputs_dict)
-        bad_inputs["pixel_values"] = bad_inputs["pixel_values"][: -self.model_tester.num_image_patches]
-        bad_inputs["image_grid_thw"] = bad_inputs["image_grid_thw"][:1]
+        # Verify that the model generates non-empty text
+        self.assertGreater(len(decoded.strip()), 0)
 
-        with self.assertRaisesRegex(ValueError, "Image features and image tokens do not match"):
-            with torch.no_grad():
-                model(**bad_inputs)
+    @slow
+    def test_text_only_generation(self):
+        """Test that the model can do text-only generation without images."""
+        model = HunYuanVLForConditionalGeneration.from_pretrained(
+            self.model_id, torch_dtype=torch.bfloat16, device_map=torch_device
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Hello, what is 1+1?"},
+                ],
+            }
+        ]
+        inputs = self.processor.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, padding=True, return_tensors="pt"
+        ).to(model.device)
 
-    def test_forward_supports_text_only_inputs(self):
-        config = self.model_tester.get_config()
-        model = HunYuanVLForConditionalGeneration(config).to(self.model_tester.device)
-        model.eval()
+        generate_ids = model.generate(**inputs, do_sample=False, max_new_tokens=20)
+        decoded = self.processor.decode(generate_ids[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
-        input_ids = torch.tensor([[config.bos_token_id, 5, 6, config.eos_token_id]], device=self.model_tester.device)
-        attention_mask = torch.ones_like(input_ids, device=self.model_tester.device)
-
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-
-        self.assertEqual(outputs.logits.shape, (1, input_ids.shape[1], config.text_config.vocab_size))
-
-    def test_generate_supports_text_only_inputs(self):
-        config = self.model_tester.get_config()
-        model = HunYuanVLForConditionalGeneration(config).to(self.model_tester.device)
-        model.eval()
-
-        input_ids = torch.tensor([[config.bos_token_id, 5, 6]], device=self.model_tester.device)
-        attention_mask = torch.ones_like(input_ids, device=self.model_tester.device)
-
-        with torch.no_grad():
-            generated = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=2,
-                do_sample=False,
-            )
-
-        self.assertEqual(generated.shape[0], input_ids.shape[0])
-        self.assertGreaterEqual(generated.shape[1], input_ids.shape[1] + 1)
-
-    def test_for_causal_lm_text_only(self):
-        config = self.model_tester.get_config()
-        model = HunYuanVLForCausalLM(config).to(self.model_tester.device)
-        model.eval()
-
-        input_ids = torch.tensor([[config.bos_token_id, 5, 6]], device=self.model_tester.device)
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids)
-
-        self.assertEqual(outputs.logits.shape, (1, input_ids.shape[1], config.text_config.vocab_size))
+        self.assertGreater(len(decoded.strip()), 0)

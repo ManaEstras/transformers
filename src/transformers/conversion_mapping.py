@@ -538,6 +538,32 @@ def _build_checkpoint_conversion_mapping():
                 source_patterns=r"^model(?!\.(language_model|visual))", target_patterns="model.language_model"
             ),
         ],
+        "HunYuanVLForConditionalGeneration": [
+            # Vision-internal leaf renames (the vision tower now inherits Siglip/Mllama naming). These must run
+            # BEFORE the structural prefix rules below, since they are anchored on the original ``vit.`` prefix.
+            WeightRenaming(
+                source_patterns=r"^vit\.layers\.(\d+)\.mlp\.dense_h_to_4h\.",
+                target_patterns=r"vit.layers.\1.mlp.fc1.",
+            ),
+            WeightRenaming(
+                source_patterns=r"^vit\.layers\.(\d+)\.mlp\.dense_4h_to_h\.",
+                target_patterns=r"vit.layers.\1.mlp.fc2.",
+            ),
+            WeightRenaming(
+                source_patterns=r"^vit\.layers\.(\d+)\.input_layernorm\.",
+                target_patterns=r"vit.layers.\1.layer_norm1.",
+            ),
+            WeightRenaming(
+                source_patterns=r"^vit\.layers\.(\d+)\.post_attention_layernorm\.",
+                target_patterns=r"vit.layers.\1.layer_norm2.",
+            ),
+            # PatchMerger ``nn.Sequential`` (``proj.0`` / ``proj.2``) -> named conv layers.
+            WeightRenaming(source_patterns=r"^vit\.perceive\.proj\.0\.", target_patterns="vit.perceive.proj_conv1."),
+            WeightRenaming(source_patterns=r"^vit\.perceive\.proj\.2\.", target_patterns="vit.perceive.proj_conv2."),
+            # Structural prefix renames for the HunYuanVLModel wrapper: vision -> model.vit, text -> model.model.
+            WeightRenaming(source_patterns=r"^vit", target_patterns="model.vit"),
+            WeightRenaming(source_patterns=r"^model(?!\.(model|vit))", target_patterns="model.model"),
+        ],
         "deepseek_ocr2": [
             WeightRenaming(
                 source_patterns=r"sam_model\.blocks\.(\d+)\.norm1\.",

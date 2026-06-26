@@ -36,8 +36,11 @@ LEGACY_XDROPE_SCALING = {
 
 
 class HunYuanVLTextConfigTest(unittest.TestCase):
+    """Most generic config behavior is covered by `ConfigTester`; these tests cover the HunYuan-specific legacy
+    field aliasing and rope normalization that the generic mixin cannot exercise."""
+
     def test_legacy_text_aliases_are_normalized(self):
-        """Legacy ``rope_scaling`` / ``pad_id`` / ``attention_head_dim`` aliases must round-trip into canonical fields."""
+        """Legacy ``rope_scaling`` / ``pad_id`` / ``attention_head_dim`` keys must map into canonical fields."""
         config = HunYuanVLTextConfig(
             pad_token_id=-1,
             pad_id=7,
@@ -46,20 +49,13 @@ class HunYuanVLTextConfigTest(unittest.TestCase):
             rope_scaling=LEGACY_XDROPE_SCALING,
         )
 
+        # ``pad_id`` / ``attention_head_dim`` are ``attribute_map`` aliases of ``pad_token_id`` / ``head_dim``.
         self.assertEqual(config.pad_token_id, 7)
         self.assertEqual(config.head_dim, 128)
-        self.assertEqual(config.rope_theta, 10000.0)
-        self.assertEqual(config.rope_parameters["type"], "dynamic")
+        # ``xdrope`` is standardized to the generic ``dynamic`` rope type, while keeping the section layout.
         self.assertEqual(config.rope_parameters["rope_type"], "dynamic")
         self.assertEqual(config.rope_parameters["rope_theta"], 10000.0)
-        self.assertEqual(config.rope_scaling["xdrope_section"], [16, 16, 16, 16])
-
-    def test_minimal_text_config_does_not_invent_rope_parameters(self):
-        """When no rope payload is provided we must not fabricate one."""
-        config = HunYuanVLTextConfig()
-        # The dataclass parent runs ``standardize_rope_params`` and produces a canonical default RoPE blob.
-        self.assertIn("rope_type", config.rope_parameters)
-        self.assertEqual(config.rope_parameters["rope_type"], "default")
+        self.assertEqual(config.rope_parameters["xdrope_section"], [16, 16, 16, 16])
 
 
 class HunYuanVLVisionConfigTest(unittest.TestCase):
@@ -80,13 +76,12 @@ class HunYuanVLConfigTest(unittest.TestCase):
             reloaded = HunYuanVLConfig.from_pretrained(tmp_dir)
             self.assertDictEqual(config.to_dict(), reloaded.to_dict())
 
-    def test_top_level_token_ids_are_propagated_from_text_config(self):
-        text_config = HunYuanVLTextConfig(pad_token_id=11, bos_token_id=22, eos_token_id=33)
-        config = HunYuanVLConfig(text_config=text_config)
-
-        self.assertEqual(config.pad_token_id, 11)
-        self.assertEqual(config.bos_token_id, 22)
-        self.assertEqual(config.eos_token_id, 33)
+    def test_image_token_id_aliases(self):
+        """The released config uses the longer ``image_*_token_id`` spellings, aliased to ``im_*_id``."""
+        config = HunYuanVLConfig(image_start_token_id=100, image_end_token_id=101, image_newline_token_id=102)
+        self.assertEqual(config.im_start_id, 100)
+        self.assertEqual(config.im_end_id, 101)
+        self.assertEqual(config.im_newline_id, 102)
 
     def test_explicit_text_config_instance_is_preserved(self):
         text_config = HunYuanVLTextConfig(hidden_size=111)

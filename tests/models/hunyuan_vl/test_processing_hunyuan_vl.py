@@ -1,4 +1,4 @@
-# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+# Copyright (C) 2026 THL A29 Limited, a Tencent company and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,69 +14,125 @@
 
 import unittest
 
-from PIL import Image
-from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
-from tokenizers.pre_tokenizers import Whitespace
+import numpy as np
 
-from transformers import PreTrainedTokenizerFast
-from transformers.models.hunyuan_vl.image_processing_hunyuan_vl import HunYuanVLImageProcessor
+from transformers.testing_utils import require_torch, require_vision
+from transformers.utils import is_torch_available, is_torchvision_available
+
+from ...test_processing_common import ProcessorTesterMixin
+
+
+if is_torch_available():
+    import torch
+
+if is_torchvision_available():
+    from transformers.models.hunyuan_vl.image_processing_hunyuan_vl import HunYuanVLImageProcessor
+
 from transformers.models.hunyuan_vl.processing_hunyuan_vl import HunYuanVLProcessor
-from transformers.testing_utils import require_torch
 
 
-class HunYuanVLProcessorTest(unittest.TestCase):
-    def get_tokenizer(self):
-        vocab = {
-            "<unk>": 0,
-            "<pad>": 1,
-            "<bos>": 2,
-            "<eos>": 3,
-            "<image_start>": 4,
-            "<image>": 5,
-            "<image_end>": 6,
-            "hello": 7,
-            "<placeholder>": 8,
-        }
-        tokenizer = Tokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
-        tokenizer.pre_tokenizer = Whitespace()
-        fast_tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=tokenizer,
-            unk_token="<unk>",
-            pad_token="<pad>",
-            bos_token="<bos>",
-            eos_token="<eos>",
-            additional_special_tokens=["<image_start>", "<image>", "<image_end>", "<placeholder>"],
-        )
-        fast_tokenizer.image_start_token = "<image_start>"
-        fast_tokenizer.image_token = "<image>"
-        fast_tokenizer.image_end_token = "<image_end>"
-        return fast_tokenizer
+@require_torch
+@require_vision
+class HunYuanVLProcessorTest(ProcessorTesterMixin, unittest.TestCase):
+    processor_class = HunYuanVLProcessor
 
-    def get_processor(self):
-        image_processor = HunYuanVLImageProcessor(
+    @classmethod
+    def _setup_image_processor(cls):
+        if is_torchvision_available():
+            return HunYuanVLImageProcessor(
+                min_pixels=32 * 32,
+                max_pixels=32 * 32,
+                patch_size=16,
+                temporal_patch_size=1,
+                merge_size=1,
+            )
+        # Fallback to PIL processor if torchvision not available
+        from transformers.models.hunyuan_vl.image_processing_pil_hunyuan_vl import HunYuanVLImageProcessorPil
+
+        return HunYuanVLImageProcessorPil(
             min_pixels=32 * 32,
             max_pixels=32 * 32,
             patch_size=16,
             temporal_patch_size=1,
             merge_size=1,
         )
-        return HunYuanVLProcessor(image_processor=image_processor, tokenizer=self.get_tokenizer())
+
+    @classmethod
+    def _setup_tokenizer(cls):
+        tokenizer_class = cls._get_component_class_from_processor("tokenizer")
+        tokenizer = tokenizer_class.from_pretrained("tencent/HunyuanOCR")
+        return tokenizer
+
+    @classmethod
+    def _setup_test_attributes(cls, processor):
+        cls.image_token = getattr(processor, "image_token", "<image>")
+
+    def test_model_input_names(self):
+        processor = self.get_processor()
+        expected_names = {"input_ids", "attention_mask", "pixel_values", "image_grid_thw"}
+        self.assertSetEqual(set(processor.model_input_names), expected_names)
 
     @require_torch
-    def test_processor_outputs_image_only_inputs(self):
+    def _test_apply_chat_template(
+        self,
+        modality: str,
+        batch_size: int,
+        return_tensors: str,
+        input_name: str,
+        processor_name: str,
+        input_data: list[str],
+    ):
+        # HunYuanVL flattens vision features into per-patch rows, so ``pixel_values`` does not scale with batch size
+        # the same way as standard models. This override mirrors Qwen2-VL's: it derives the expected ``pixel_values``
+        # length from ``image_grid_thw`` instead of asserting it equals ``batch_size``.
         processor = self.get_processor()
-        image = Image.new("RGB", (32, 32), color="white")
+        if processor.chat_template is None:
+            self.skipTest("Processor has no chat template")
+        if processor_name not in self.processor_class.get_attributes():
+            self.skipTest(f"{processor_name} attribute not present in {self.processor_class}")
 
-        inputs = processor(text=["<image> hello"], images=[image], padding=True, return_tensors="pt")
+        batch_messages = [
+            [{"role": "user", "content": [{"type": "text", "text": "Describe this."}]}]
+        ] * batch_size
 
-        self.assertSetEqual(
-            set(inputs.keys()),
-            {"input_ids", "attention_mask", "position_ids", "imgs_pos", "pixel_values", "image_grid_thw"},
+        formatted_prompt = processor.apply_chat_template(batch_messages, add_generation_prompt=True, tokenize=False)
+        self.assertEqual(len(formatted_prompt), batch_size)
+
+        out_dict_text = processor.apply_chat_template(
+            batch_messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors=return_tensors,
         )
-        self.assertEqual(inputs["position_ids"].shape[1], 4)
-        self.assertGreater(inputs["pixel_values"].shape[0], 0)
-        self.assertEqual(inputs["image_grid_thw"].shape[-1], 3)
+        self.assertTrue(all(key in out_dict_text for key in ["input_ids", "attention_mask"]))
+        self.assertEqual(len(out_dict_text["input_ids"]), batch_size)
+        self.assertEqual(len(out_dict_text["attention_mask"]), batch_size)
+
+        for idx, url in enumerate(input_data[:batch_size]):
+            batch_messages[idx][0]["content"] = [batch_messages[idx][0]["content"][0], {"type": modality, "url": url}]
+
+        out_dict = processor.apply_chat_template(
+            batch_messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors=return_tensors,
+        )
+        resolved_input_name = getattr(self, input_name)
+        self.assertTrue(resolved_input_name in out_dict)
+        self.assertEqual(len(out_dict["input_ids"]), batch_size)
+        self.assertEqual(len(out_dict["attention_mask"]), batch_size)
+
+        # ``pixel_values`` length equals the total number of patch rows across all images.
+        expected_patch_rows = 0
+        for thw in out_dict["image_grid_thw"]:
+            expected_patch_rows += int(thw[0] * thw[1] * thw[2])
+        self.assertEqual(len(out_dict[resolved_input_name]), expected_patch_rows)
+
+        return_tensor_to_type = {"pt": torch.Tensor, "np": np.ndarray, None: list}
+        for value in out_dict.values():
+            self.assertIsInstance(value, return_tensor_to_type[return_tensors])
 
     def test_get_num_multimodal_tokens(self):
         processor = self.get_processor()
@@ -85,10 +141,3 @@ class HunYuanVLProcessorTest(unittest.TestCase):
         self.assertEqual(len(output["num_image_tokens"]), 1)
         self.assertEqual(len(output["num_image_patches"]), 1)
         self.assertGreater(output["num_image_tokens"][0], 0)
-
-    def test_model_input_names(self):
-        processor = self.get_processor()
-        self.assertSetEqual(
-            set(processor.model_input_names),
-            {"input_ids", "attention_mask", "pixel_values", "image_grid_thw", "position_ids", "imgs_pos"},
-        )
